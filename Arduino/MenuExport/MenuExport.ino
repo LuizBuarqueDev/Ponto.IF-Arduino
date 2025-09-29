@@ -4,8 +4,6 @@
 SoftwareSerial mySerial(2, 3);  // RX=2, TX=3
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
 
-const int TEMPLATE_SIZE = 498;
-
 void setup() {
   Serial.begin(115200);
   finger.begin(57600);
@@ -28,8 +26,11 @@ void loop() {
     int id = cmd.substring(7).toInt();
     doExport(id);
   } else if (cmd.startsWith("IMPORT")) {
-    int id = cmd.substring(7).toInt();
-    doImport(id);
+    int space1 = cmd.indexOf(' ');
+    int space2 = cmd.indexOf(' ', space1 + 1);
+    int id = cmd.substring(space1 + 1, space2).toInt();
+    int length = cmd.substring(space2 + 1).toInt();
+    doImport(id, length);
   } else if (cmd == "CLEAR") {
     uint8_t r = finger.emptyDatabase();
     if (r == FINGERPRINT_OK) Serial.println("CLEARED");
@@ -43,6 +44,8 @@ void loop() {
       Serial.print("COUNT_FAIL code=");
       Serial.println(r, HEX);
     }
+  } else if (cmd == "VERIFY") {
+    doVerify();
   }
 }
 
@@ -73,34 +76,51 @@ void doEnroll(int id) {
   }
 }
 
-// ===== EXPORT =====
+// ===== EXPORT com debug extra =====
 void doExport(int id) {
-  if (finger.loadModel(id) != FINGERPRINT_OK) { Serial.println("EXPORT_FAIL_LOAD"); return; }
-  if (finger.getModel() != FINGERPRINT_OK) { Serial.println("EXPORT_FAIL_UPLOAD"); return; }
+  Serial.print("EXPORT_ID=");
+  Serial.println(id);
 
-  uint8_t buf[TEMPLATE_SIZE];
-  if (finger.get_template_buffer(TEMPLATE_SIZE, buf) != FINGERPRINT_OK) {
-    Serial.println("EXPORT_FAIL_BUF");
-    return;
+  uint8_t r;
+
+  r = finger.loadModel(id);
+  Serial.print("loadModel -> "); Serial.println(r);
+  if (r != FINGERPRINT_OK) { Serial.println("EXPORT_FAIL_LOAD"); return; }
+
+  r = finger.getModel();
+  Serial.print("getModel -> "); Serial.println(r);
+  if (r != FINGERPRINT_OK) { Serial.println("EXPORT_FAIL_UPLOAD"); return; }
+
+  Serial.println(">>> TEMPLATE_RAW_START <<<");
+
+  unsigned long start = millis();
+  int count = 0;
+  while (millis() - start < 2000) {
+    if (mySerial.available()) {
+      int b = mySerial.read();
+      Serial.write(b);
+      count++;
+      start = millis();
+    }
   }
-  Serial.println("TEMPLATE_BIN_START");
-  for (int i = 0; i < TEMPLATE_SIZE; i++) {
-    Serial.write(buf[i]);
-    delayMicroseconds(200); // dá tempo do host ler
-  }
-  Serial.println("TEMPLATE_BIN_END");
+
+  Serial.println(">>> TEMPLATE_RAW_END <<<");
+  Serial.print("TEMPLATE_SIZE=");
+  Serial.println(count);
 }
 
 // ===== IMPORT =====
-void doImport(int id) {
+void doImport(int id, int length) {
   Serial.print("IMPORT_ID=");
   Serial.println(id);
+  Serial.print("Esperando bytes=");
+  Serial.println(length);
 
-  uint8_t buf[TEMPLATE_SIZE];
+  uint8_t buf[length];
   int received = 0;
   unsigned long start = millis();
 
-  while (received < TEMPLATE_SIZE && millis() - start < 10000) {
+  while (received < length && millis() - start < 10000) {
     if (Serial.available()) {
       buf[received++] = Serial.read();
       start = millis();
@@ -110,13 +130,13 @@ void doImport(int id) {
   Serial.print("Recebidos=");
   Serial.println(received);
 
-  if (received != TEMPLATE_SIZE) { 
-    Serial.println("IMPORT_FAIL_LEN"); 
-    return; 
+  if (received != length) {
+    Serial.println("IMPORT_FAIL_LEN");
+    return;
   }
 
-  if (!finger.write_template_to_sensor(TEMPLATE_SIZE, buf)) {
-    Serial.println("IMPORT_FAIL_WRITE"); 
+  if (!finger.write_template_to_sensor(length, buf)) {
+    Serial.println("IMPORT_FAIL_WRITE");
     return;
   }
 
@@ -126,5 +146,30 @@ void doImport(int id) {
   } else {
     Serial.print("IMPORT_FAIL_STORE code=0x");
     Serial.println(r, HEX);
+  }
+}
+
+// ===== VERIFY =====
+void doVerify() {
+  Serial.println("Coloque o dedo para verificar...");
+  int p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) { delay(100); continue; }
+    if (p == FINGERPRINT_PACKETRECIEVEERR) { Serial.println("VERIFY_FAIL_COMM"); return; }
+    if (p == FINGERPRINT_IMAGEFAIL) { Serial.println("VERIFY_FAIL_IMAGE"); return; }
+  }
+  Serial.println("Imagem capturada!");
+
+  if (finger.image2Tz(1) != FINGERPRINT_OK) {
+    Serial.println("VERIFY_FAIL_TZ");
+    return;
+  }
+
+  if (finger.fingerFastSearch() == FINGERPRINT_OK) {
+    Serial.print("MATCH:");
+    Serial.println(finger.fingerID);
+  } else {
+    Serial.println("NO_MATCH");
   }
 }

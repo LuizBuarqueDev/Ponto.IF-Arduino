@@ -1,13 +1,10 @@
 import serial, time, os
 
-PORT = "COM3"   # ajuste conforme necessário
+PORT = "COM3"
 BAUD = 115200
-TEMPLATE_SIZE = 498
-
-# ----------------- Utilitários -----------------
 
 def open_serial():
-    ser = serial.Serial(PORT, BAUD, timeout=0.2)
+    ser = serial.Serial(PORT, BAUD, timeout=0.5)
     time.sleep(2)
     ser.reset_input_buffer()
     return ser
@@ -16,19 +13,12 @@ def send(ser, line):
     ser.write((line + "\n").encode("ascii"))
     ser.flush()
 
-def wait_marker(ser, marker, timeout=5):
-    buf = b""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if ser.in_waiting:
-            buf += ser.read(ser.in_waiting)
-            if marker.encode() in buf:
-                return True
-        else:
-            time.sleep(0.01)
-    return False
-
-# ----------------- Comandos -----------------
+def get_count(ser):
+    send(ser, "COUNT")
+    line = ser.read_until(b"\n").decode(errors="ignore").strip()
+    if line.startswith("COUNT="):
+        return int(line.split("=")[1])
+    return 0
 
 def enroll(ser, id):
     send(ser, f"ENROLL {id}")
@@ -39,65 +29,75 @@ def enroll(ser, id):
             if "ENROLL_OK" in line or "FAIL" in line:
                 break
 
-def get_count(ser):
-    send(ser, "COUNT")
-    deadline = time.time() + 3
-    while time.time() < deadline:
-        line = ser.read_until(b"\n").decode(errors="ignore").strip()
-        if line.startswith("COUNT="):
-            return int(line.split("=")[1])
-    return 0
-
 def export_all(ser):
     count = get_count(ser)
     print("Templates armazenados:", count)
-
     os.makedirs("templates", exist_ok=True)
 
     for id in range(1, count+1):
         send(ser, f"EXPORT {id}")
-        if not wait_marker(ser, "TEMPLATE_BIN_START", 5):
-            print(f"ID {id} falhou (sem start)")
-            continue
+
+        # lê debug até marcador
+        while True:
+            line = ser.readline().decode(errors="ignore").strip()
+            print("[DEBUG]", line)  # <-- debug do Arduino
+            if "TEMPLATE_RAW_START" in line:
+                break
+
         data = b""
-        while len(data) < TEMPLATE_SIZE:
-            chunk = ser.read(TEMPLATE_SIZE - len(data))
-            if not chunk: break
-            data += chunk
-        wait_marker(ser, "TEMPLATE_BIN_END", 5)
-        if len(data) == TEMPLATE_SIZE:
-            with open(f"templates/{id}.bin","wb") as f:
-                f.write(data)
-            print(f"ID {id} exportado")
-        else:
-            print(f"ID {id} incompleto ({len(data)} bytes)")
+        while True:
+            chunk = ser.read(ser.in_waiting or 1)
+            if chunk:
+                data += chunk
+            if b"TEMPLATE_RAW_END" in data:
+                break
+
+        start = data.find(b"TEMPLATE_RAW_START")
+        end = data.find(b"TEMPLATE_RAW_END")
+        template_bytes = data[start+len("TEMPLATE_RAW_START"):end]
+
+        size_line = ser.readline().decode(errors="ignore").strip()
+        print("[DEBUG]", size_line)
+
+        fname = f"templates/{id}.bin"
+        with open(fname, "wb") as f:
+            f.write(template_bytes)
+        print(f"ID {id} exportado ({len(template_bytes)} bytes)")
 
 def clear_db(ser):
     send(ser, "CLEAR")
-    line = ser.read_until(b"\n").decode(errors="ignore").strip()
-    print(line)
+    print(ser.readline().decode(errors="ignore").strip())
 
 def import_all(ser):
     for fname in sorted(os.listdir("templates")):
         if not fname.endswith(".bin"): continue
         id = int(fname.split(".")[0])
-        send(ser, f"IMPORT {id}")
-        with open(os.path.join("templates", fname),"rb") as f:
-            ser.write(f.read())
+        with open(os.path.join("templates", fname), "rb") as f:
+            data = f.read()
+        size = len(data)
+        print(f"Importando ID {id} ({size} bytes)")
+        send(ser, f"IMPORT {id} {size}")
+        ser.write(data)
         ser.flush()
-
-        # Aguarda resposta completa
-        deadline = time.time() + 5
-        resp = ""
-        while time.time() < deadline:
+        while True:
             line = ser.readline().decode(errors="ignore").strip()
-            if line:
-                resp += line + " "
-                if "IMPORT_OK" in line or "IMPORT_FAIL" in line:
-                    break
-        print(f"IMPORT {id} -> {resp.strip()}")
+            print("[DEBUG]", line)
+            if "IMPORT_OK" in line or "IMPORT_FAIL" in line:
+                break
 
-# ----------------- Menu interativo -----------------
+def loop_verify(ser):
+    print("Iniciando verificação contínua (CTRL+C para sair)")
+    try:
+        while True:
+            send(ser, "VERIFY")
+            line = ser.readline().decode(errors="ignore").strip()
+            print("[DEBUG]", line)
+            if "MATCH:" in line or "NO_MATCH" in line:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        print("Loop de verificação interrompido.")
+
+# ----------------- Menu -----------------
 
 def menu():
     ser = open_serial()
@@ -105,14 +105,15 @@ def menu():
         print("\n=== MENU FINGERPRINT ===")
         print("1 - Enroll nova digital")
         print("2 - Contar digitais salvas")
-        print("3 - Exportar todas digitais para pasta 'templates'")
-        print("4 - Apagar todas digitais (CLEAR)")
-        print("5 - Importar digitais da pasta 'templates'")
+        print("3 - Exportar digitais")
+        print("4 - Apagar todas digitais")
+        print("5 - Importar digitais")
+        print("6 - Loop Verify (comparar dedo)")
         print("0 - Sair")
         choice = input("Escolha uma opção: ")
 
         if choice == "1":
-            id = input("Digite o ID para salvar (ex: 1): ")
+            id = input("Digite o ID: ")
             enroll(ser, int(id))
         elif choice == "2":
             print("Total no sensor:", get_count(ser))
@@ -122,6 +123,8 @@ def menu():
             clear_db(ser)
         elif choice == "5":
             import_all(ser)
+        elif choice == "6":
+            loop_verify(ser)
         elif choice == "0":
             ser.close()
             break
